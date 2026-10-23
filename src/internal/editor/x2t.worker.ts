@@ -415,6 +415,52 @@ async function sanitizeDocxForX2t(data: ArrayBuffer, fileFrom: string) {
 }
 
 /**
+ * 上游 x2t.js 把 libheif 留成 `abort("missing function")` 桩。
+ * 旧版 ppt 里的 wmf/dib 会走这条探测，一调用就把整个 wasm 打停，
+ * 编辑器只弹「未知错误」，后面的页也出不来。
+ * 桩改成返回 heif_error_Unsupported_filetype（3），这一张图跳过，其余照常打开。
+ * 已经换过桩的脚本里找不到原来的 abort，这里就原样返回。
+ */
+function softenMissingHeifStubs(scriptSource: string): string {
+  const writeError =
+    "if(e){HEAP32[e>>2]=3;HEAP32[e+4>>2]=0;HEAP32[e+8>>2]=0;}";
+  const sret = [
+    "_heif_context_encode_image",
+    "_heif_context_get_encoder_for_format",
+    "_heif_context_get_primary_image_handle",
+    "_heif_context_read_from_file",
+    "_heif_context_read_from_memory_without_copy",
+    "_heif_context_write_to_file",
+    "_heif_decode_image",
+    "_heif_image_add_plane",
+    "_heif_image_create",
+  ];
+  const ret0 = [
+    "_heif_context_alloc",
+    "_heif_image_get_plane",
+    "_heif_image_get_plane_readonly",
+    "_heif_image_get_primary_height",
+    "_heif_image_get_primary_width",
+  ];
+  const noop = [
+    "_heif_context_free",
+    "_heif_encoder_release",
+    "_heif_image_handle_release",
+    "_heif_image_release",
+  ];
+  let out = scriptSource;
+  const replaceStub = (name: string, args: string, body: string) => {
+    const old = `function ${name}(){abort("missing function: ${name.slice(1)}")}`;
+    if (!out.includes(old)) return;
+    out = out.replace(old, `function ${name}(${args}){${body}}`);
+  };
+  for (const name of sret) replaceStub(name, "e", writeError);
+  for (const name of ret0) replaceStub(name, "", "return 0");
+  for (const name of noop) replaceStub(name, "", "");
+  return out;
+}
+
+/**
  * @description 在 Worker 全局作用域执行 Emscripten 脚本；classic worker 用 importScripts，module worker 用间接 eval。
  */
 function executeEmscriptenScript(scriptSource: string): void {
@@ -469,7 +515,7 @@ async function initX2t(params?: X2tConvertParams): Promise<void> {
     wasmBinary,
   });
 
-  executeEmscriptenScript(scriptSource);
+  executeEmscriptenScript(softenMissingHeifStubs(scriptSource));
 
   x2t = (self as any).Module;
 

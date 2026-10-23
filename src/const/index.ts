@@ -260,8 +260,10 @@ function buildStaticResource(): StaticResource {
     },
     x2t: {
       root: x2tRoot,
-      script: `${x2tRoot}/x2t.js`,
-      wasm: `${x2tRoot}/x2t.wasm`,
+      // 查询参数用来避开浏览器按启发式缓存住的旧 x2t.js。旧文件里的 heif 桩会 abort，编辑器只显示「未知错误」。
+      script: `${x2tRoot}/x2t.js?v=20261023`,
+      // 同一查询参数让浏览器重新拉取 wasm。旧 wasm 在部分图片回调为空时会直接中断转换。
+      wasm: `${x2tRoot}/x2t.wasm?v=20261023d`,
       pdfFonts: {
         root: x2tPdfFontsRoot,
         default: `${x2tPdfFontsRoot}/${X2T_PDF_DEFAULT_FONT_FILE}`,
