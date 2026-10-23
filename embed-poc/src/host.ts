@@ -43,6 +43,18 @@ const 体积上限 = 参数.has("officeXmlLimitBytes") ? Number(参数.get("offi
  * 而那条断言就成了恒真。
  */
 const 无插件 = 参数.get("noPlugin") === "1";
+/**
+ * 预览模式开关（验缩放钮是否可点）。
+ * `?mode=view` 或 `?readOnly=1` → 只读；默认 edit。
+ * `?keepViewControls=0` 可关掉「保留视图缩放」对照。
+ * `?zoom=-2` 默认适应宽度；也可传 -1 / 百分数。
+ */
+const 预览模式 =
+  参数.get("mode") === "view" ||
+  参数.get("readOnly") === "1" ||
+  参数.get("readOnly") === "true";
+const 保留视图控件 = 参数.get("keepViewControls") !== "0";
+const 缩放参数 = 参数.has("zoom") ? Number(参数.get("zoom")) : 预览模式 ? -2 : undefined;
 
 const 日志框 = document.getElementById("日志")!;
 const 状态框 = document.getElementById("状态")!;
@@ -271,12 +283,33 @@ async function 发open() {
     saveUrl: location.origin + "/file",
     baseVersion: 基准版,
     lang: "zh",
+    ...(预览模式
+      ? {
+          mode: "view" as const,
+          keepViewControls: 保留视图控件,
+          suppressLeavePrompt: true,
+          migrateFitPageZoom: true,
+          ...(缩放参数 !== undefined && Number.isFinite(缩放参数)
+            ? { zoom: 缩放参数 }
+            : {}),
+        }
+      : {}),
     ...(插件配置 ? { plugins: 插件配置 } : {}),
     // 实测那条「导出回落成原文件时必须拒绝上传」用它把闸门压到一个必然触发的值。
     // 平时不给，就是不设这道闸。
     ...(体积上限 !== null ? { officeXmlLimitBytes: 体积上限 } : {}),
   });
-  说("已发 open，等它打开…");
+  说(
+    预览模式
+      ? `已发 open（预览 mode=view, keepViewControls=${保留视图控件}）…`
+      : "已发 open，等它打开…",
+  );
+  if (预览模式) {
+    记(
+      `预览参数 mode=view keepViewControls=${保留视图控件}` +
+        (缩放参数 !== undefined ? ` zoom=${缩放参数}` : ""),
+    );
+  }
 }
 
 function 发给接入页(m: HostMessage) {

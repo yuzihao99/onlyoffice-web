@@ -329,6 +329,10 @@ export class EditorManager {
   private viewControlsObserver: MutationObserver | null = null;
   private viewControlsTimer: number | null = null;
   private viewControlsWatchdogStopTimer: number | null = null;
+  /** 防止 MutationObserver ↔ DOM 解锁互相触发把 iframe 主线程打满 */
+  private viewControlsEnsuring = false;
+  private viewControlsUnlocked = false;
+  private viewControlsObsTimer: number | null = null;
   /** 与容器一一对应，供事件与 Connector 使用同一稳定路由键。 */
   private instanceId: string;
   private containerId: string;
@@ -1410,15 +1414,21 @@ export class EditorManager {
       window.clearTimeout(this.viewControlsWatchdogStopTimer);
       this.viewControlsWatchdogStopTimer = null;
     }
+    if (this.viewControlsObsTimer !== null) {
+      window.clearTimeout(this.viewControlsObsTimer);
+      this.viewControlsObsTimer = null;
+    }
     if (this.viewControlsObserver) {
       this.viewControlsObserver.disconnect();
       this.viewControlsObserver = null;
     }
+    this.viewControlsEnsuring = false;
+    this.viewControlsUnlocked = false;
   }
 
   /**
    * OnlyOffice 会在 restriction / 工具栏延迟渲染后再次给缩放钮加 disabled。
-   * 短时轮询 + MutationObserver，把按钮保持可点。
+   * 前 15s 较快轮询 + 防抖 MutationObserver；稳定解锁后降频，避免 DOM 反馈环卡死 iframe。
    */
   private startViewControlsWatchdog() {
     this.stopViewControlsWatchdog();
@@ -1435,18 +1445,35 @@ export class EditorManager {
     };
 
     tick();
-    this.viewControlsTimer = window.setInterval(tick, 400);
+    this.viewControlsTimer = window.setInterval(tick, 800);
     this.viewControlsWatchdogStopTimer = window.setTimeout(() => {
-      this.stopViewControlsWatchdog();
-    }, 12000);
+      if (this.viewControlsTimer !== null) {
+        window.clearInterval(this.viewControlsTimer);
+        this.viewControlsTimer = null;
+      }
+      // 稳定后慢轮询，防 OO 后期又加锁
+      this.viewControlsTimer = window.setInterval(tick, 3000);
+    }, 15000);
 
     try {
       const win = this.getEditorFrameWindow();
       const toolbar = win?.document?.querySelector(".toolbar");
       if (toolbar && typeof MutationObserver !== "undefined") {
-        this.viewControlsObserver = new MutationObserver(() => tick());
+        this.viewControlsObserver = new MutationObserver(() => {
+          if (this.viewControlsEnsuring) {
+            return;
+          }
+          if (this.viewControlsObsTimer !== null) {
+            window.clearTimeout(this.viewControlsObsTimer);
+          }
+          this.viewControlsObsTimer = window.setTimeout(() => {
+            this.viewControlsObsTimer = null;
+            tick();
+          }, 250);
+        });
         this.viewControlsObserver.observe(toolbar, {
           attributes: true,
+          childList: true,
           subtree: true,
           attributeFilter: ["class", "disabled", "aria-disabled"],
         });
@@ -1454,20 +1481,76 @@ export class EditorManager {
     } catch {
       // ignore
     }
+
+    this.installEditingDisableGuard();
   }
 
   /**
-   * 去掉 toolbar-mask，并强制启用 View 页缩放控件。
-   * injectButtons 初始 disabled:true，且 keepState 可能仍含 lostConnect 等锁；
-   * 只清 disableOnStart 不够，会再次被 lockControls 置灰。
+   * 拦截 iframe 内 editing:disable：keepViewControls 时强制不盖 toolbar-mask、不锁 statusBar。
+   * Main.disableEditing / onDocModeApply 仍会自行 trigger，只靠事后清不够。
+   */
+  private installEditingDisableGuard() {
+    if (!this.keepViewControls || !this.readOnly) {
+      return;
+    }
+    const win = this.getEditorFrameWindow() as
+      | (OnlyOfficeIframeWindow & {
+          Common?: {
+            NotificationCenter?: {
+              trigger?: (...args: unknown[]) => unknown;
+              __oowKeepViewPatched?: boolean;
+            };
+          };
+        })
+      | undefined;
+    const nc = win?.Common?.NotificationCenter;
+    if (!nc?.trigger || nc.__oowKeepViewPatched) {
+      return;
+    }
+    const original = nc.trigger.bind(nc);
+    nc.trigger = (...args: unknown[]) => {
+      if (args[0] === "editing:disable" && this.keepViewControls && this.readOnly) {
+        const disable = args[1];
+        const options = (args[2] || {}) as Record<string, unknown>;
+        if (disable) {
+          args[2] = {
+            ...options,
+            toolbar: false,
+            statusBar: false,
+            viewport: false,
+          };
+        }
+      }
+      const ret = original(...args);
+      if (args[0] === "editing:disable" && this.keepViewControls && this.readOnly) {
+        window.setTimeout(() => this.ensureViewControlsUsable(), 0);
+      }
+      return ret;
+    };
+    nc.__oowKeepViewPatched = true;
+  }
+
+  /**
+   * 去掉 toolbar-mask，并用 Common.Utils.lockControls 清 View 缩放锁。
+   * injectButtons 初始 disabled:true + keepState；直接 setDisabled 会被 keepState 立刻锁回。
    */
   private ensureViewControlsUsable() {
-    if (!this.keepViewControls) {
+    if (!this.keepViewControls || this.viewControlsEnsuring) {
       return;
     }
 
     const win = this.getEditorFrameWindow() as
       | (OnlyOfficeIframeWindow & {
+          Common?: {
+            Utils?: {
+              lockControls?: (
+                causes: unknown,
+                lock: boolean,
+                opts?: { array?: unknown[]; clear?: unknown[] },
+              ) => void;
+            };
+            enumLock?: Record<string, unknown>;
+          };
           DE?: { getController?: (name: string) => ViewTabControllerLike };
           PDFE?: { getController?: (name: string) => ViewTabControllerLike };
           PE?: { getController?: (name: string) => ViewTabControllerLike };
@@ -1481,97 +1564,148 @@ export class EditorManager {
       return;
     }
 
+    // 已解锁且无 mask 时跳过 DOM 写入，打断 MutationObserver 反馈环
     try {
-      win.document
-        ?.querySelectorAll(".toolbar-mask, .toolbar-group-mask")
-        .forEach((el) => el.remove());
-      win.document
-        ?.querySelectorAll(".toolbar.masked")
-        .forEach((el) => el.classList.remove("masked"));
+      const root = win.document;
+      const fw =
+        root?.querySelector(".slot-btn-ftw .btn") ||
+        root?.querySelector('[id*="tlbtn-btn-ftw"]');
+      const hasMask = !!root?.querySelector(
+        ".toolbar-mask, .toolbar-group-mask",
+      );
+      const fwOk =
+        !!fw &&
+        !fw.classList.contains("disabled") &&
+        !fw.hasAttribute("disabled");
+      if (
+        this.viewControlsUnlocked &&
+        fwOk &&
+        !hasMask &&
+        !!root?.getElementById("oow-keep-view-controls-css")
+      ) {
+        return;
+      }
+    } catch {
+      // ignore and continue full unlock
+    }
+
+    this.viewControlsEnsuring = true;
+    // 暂停观察，避免我们自己的 class/disabled 改动再次入队
+    try {
+      this.viewControlsObserver?.disconnect();
     } catch {
       // ignore
     }
 
-    const enableBtn = (btn: ZoomControlLike | null | undefined) => {
-      if (!btn || typeof btn.setDisabled !== "function") {
-        return;
-      }
+    try {
       try {
-        if (Array.isArray(btn.keepState)) {
-          btn.keepState.length = 0;
-        }
-        // 绕过 setDisabled 内部 this.disabled != disabled 短路
-        if (btn.isDisabled?.()) {
-          btn.setDisabled(false);
-        } else {
-          (btn as { disabled?: boolean }).disabled = true;
-          btn.setDisabled(false);
-        }
+        win.document
+          ?.querySelectorAll(".toolbar-mask, .toolbar-group-mask")
+          .forEach((el) => el.remove());
+        win.document
+          ?.querySelectorAll(".toolbar.masked")
+          .forEach((el) => el.classList.remove("masked"));
       } catch {
         // ignore
       }
-    };
 
-    const enableMany = (items: unknown) => {
-      if (!items) {
-        return;
-      }
-      if (Array.isArray(items)) {
-        items.forEach((item) => enableBtn(item as ZoomControlLike));
-        return;
-      }
-      const set = items as {
-        setDisabled?: (v: boolean) => void;
-        each?: (fn: (b: ZoomControlLike) => void) => void;
-        forEach?: (fn: (b: ZoomControlLike) => void) => void;
+      const enableBtn = (btn: ZoomControlLike | null | undefined) => {
+        if (!btn || typeof btn.setDisabled !== "function") {
+          return;
+        }
+        try {
+          if (Array.isArray(btn.keepState)) {
+            btn.keepState.length = 0;
+          }
+          // 绕过 setDisabled 内部 this.disabled != disabled 短路
+          if (btn.isDisabled?.()) {
+            btn.setDisabled(false);
+          } else {
+            (btn as { disabled?: boolean }).disabled = true;
+            btn.setDisabled(false);
+          }
+        } catch {
+          // ignore
+        }
       };
-      if (typeof set.each === "function") {
-        set.each((b) => enableBtn(b));
-      } else if (typeof set.forEach === "function") {
-        set.forEach((b) => enableBtn(b));
-      } else if (typeof set.setDisabled === "function") {
-        enableBtn(set as ZoomControlLike);
+
+      const enableMany = (items: unknown) => {
+        if (!items) {
+          return;
+        }
+        if (Array.isArray(items)) {
+          items.forEach((item) => enableBtn(item as ZoomControlLike));
+          return;
+        }
+        const set = items as {
+          setDisabled?: (v: boolean) => void;
+          each?: (fn: (b: ZoomControlLike) => void) => void;
+          forEach?: (fn: (b: ZoomControlLike) => void) => void;
+        };
+        if (typeof set.each === "function") {
+          set.each((b) => enableBtn(b));
+        } else if (typeof set.forEach === "function") {
+          set.forEach((b) => enableBtn(b));
+        } else if (typeof set.setDisabled === "function") {
+          enableBtn(set as ZoomControlLike);
+        }
+      };
+
+      try {
+        const viewTab =
+          win.DE?.getController?.("ViewTab") ??
+          win.PDFE?.getController?.("ViewTab") ??
+          win.PE?.getController?.("ViewTab") ??
+          win.SSE?.getController?.("ViewTab") ??
+          win.getApplication?.()?.getController?.("ViewTab");
+
+        viewTab?.SetDisabled?.(false);
+        const view = viewTab?.view ?? viewTab?.getView?.();
+        const locked = view?.lockedControls;
+        const enumLock = win.Common?.enumLock;
+        const lockControls = win.Common?.Utils?.lockControls;
+        if (lockControls && enumLock && Array.isArray(locked) && locked.length) {
+          const causes = [
+            enumLock.disableOnStart,
+            enumLock.lostConnect,
+            enumLock.viewMode,
+            enumLock.previewReviewMode,
+            enumLock.viewFormMode,
+            enumLock.docLockView,
+          ].filter((c) => c !== undefined);
+          if (causes.length) {
+            lockControls(causes, false, { array: locked });
+          }
+        }
+        enableMany(view?.btnsFitToPage);
+        enableMany(view?.btnsFitToWidth);
+        enableBtn(view?.btnZoom100);
+        enableBtn(view?.btnMultiplePages);
+        enableMany(view?.cmbsZoom);
+        enableMany(locked);
+      } catch {
+        // ignore
       }
-    };
 
-    try {
-      const viewTab =
-        win.DE?.getController?.("ViewTab") ??
-        win.PDFE?.getController?.("ViewTab") ??
-        win.PE?.getController?.("ViewTab") ??
-        win.SSE?.getController?.("ViewTab") ??
-        win.getApplication?.()?.getController?.("ViewTab");
-
-      viewTab?.SetDisabled?.(false);
-      const view = viewTab?.view ?? viewTab?.getView?.();
-      enableMany(view?.btnsFitToPage);
-      enableMany(view?.btnsFitToWidth);
-      enableBtn(view?.btnZoom100);
-      enableBtn(view?.btnMultiplePages);
-      enableMany(view?.cmbsZoom);
-      enableMany(view?.lockedControls);
-    } catch {
-      // ignore
-    }
-
-    // DOM 兜底：去掉 disabled 样式，避免 keepState 残留导致仍灰
-    try {
+      // DOM 兜底：去掉 disabled 样式，避免 keepState 残留导致仍灰
       const root = win.document;
-      if (!root) {
-        return;
-      }
-      if (!root.getElementById("oow-keep-view-controls-css")) {
-        const style = root.createElement("style");
-        style.id = "oow-keep-view-controls-css";
-        style.textContent = `
+      if (root) {
+        if (!root.getElementById("oow-keep-view-controls-css")) {
+          const style = root.createElement("style");
+          style.id = "oow-keep-view-controls-css";
+          style.textContent = `
 .slot-btn-ftp .btn, .slot-btn-ftw .btn, #slot-btn-zoom-100 .btn, #slot-btn-multiple-pages .btn,
+.slot-field-zoom .form-control, .slot-field-zoom input, .slot-field-zoom .btn,
 [id*="tlbtn-btn-ftp"], [id*="tlbtn-btn-ftw"],
 .slot-btn-ftp .btn.disabled, .slot-btn-ftw .btn.disabled, #slot-btn-zoom-100 .btn.disabled,
-#slot-btn-multiple-pages .btn.disabled {
+#slot-btn-multiple-pages .btn.disabled,
+.slot-field-zoom .form-control.disabled, .slot-field-zoom input:disabled {
   opacity: 1 !important;
   filter: none !important;
   pointer-events: auto !important;
   cursor: pointer !important;
+  color: inherit !important;
+  background-color: inherit !important;
 }
 .slot-btn-ftp .btn[disabled], .slot-btn-ftw .btn[disabled], #slot-btn-zoom-100 .btn[disabled],
 #slot-btn-multiple-pages .btn[disabled],
@@ -1579,21 +1713,85 @@ export class EditorManager {
   pointer-events: auto !important;
 }
 `;
-        root.head?.appendChild(style);
-      }
-      const slots = root.querySelectorAll(
-        ".slot-btn-ftp button, .slot-btn-ftw button, #slot-btn-zoom-100 button, #slot-btn-multiple-pages button, [id*='tlbtn-btn-ftp'] button, [id*='tlbtn-btn-ftw'] button, [id*='tlbtn-btn-ftp'], [id*='tlbtn-btn-ftw'], #slot-btn-zoom-100 .btn, #slot-btn-multiple-pages .btn",
-      );
-      slots.forEach((el) => {
-        el.classList.remove("disabled");
-        el.removeAttribute("disabled");
-        if (el instanceof HTMLElement) {
-          el.style.pointerEvents = "auto";
-          el.style.opacity = "1";
+          root.head?.appendChild(style);
         }
-      });
-    } catch {
-      // ignore
+        const slots = root.querySelectorAll(
+          ".slot-btn-ftp button, .slot-btn-ftw button, #slot-btn-zoom-100 button, #slot-btn-multiple-pages button, [id*='tlbtn-btn-ftp'] button, [id*='tlbtn-btn-ftw'] button, [id*='tlbtn-btn-ftp'], [id*='tlbtn-btn-ftw'], #slot-btn-zoom-100 .btn, #slot-btn-multiple-pages .btn, .slot-field-zoom input, .slot-field-zoom .form-control, .slot-field-zoom button",
+        );
+        slots.forEach((el) => {
+          el.classList.remove("disabled");
+          el.removeAttribute("disabled");
+          if (el instanceof HTMLElement) {
+            el.style.pointerEvents = "auto";
+            el.style.opacity = "1";
+          }
+        });
+
+        const fw =
+          root.querySelector(".slot-btn-ftw .btn") ||
+          root.querySelector('[id*="tlbtn-btn-ftw"]');
+        const unlocked =
+          !!fw &&
+          !fw.classList.contains("disabled") &&
+          !fw.hasAttribute("disabled") &&
+          !root.querySelector(".toolbar-mask, .toolbar-group-mask");
+        this.viewControlsUnlocked = unlocked;
+
+        // 探针 / 排障：只在状态变化时打一次
+        try {
+          const ftp =
+            root.querySelector(".slot-btn-ftp .btn") ||
+            root.querySelector('[id*="tlbtn-btn-ftp"]');
+          const zoom = root.querySelector(
+            ".slot-field-zoom input, .slot-field-zoom .form-control",
+          );
+          const report = {
+            hasMask: !!root.querySelector(".toolbar-mask, .toolbar-group-mask"),
+            hasCss: !!root.getElementById("oow-keep-view-controls-css"),
+            fitWidthDisabled: fw
+              ? fw.classList.contains("disabled") || fw.hasAttribute("disabled")
+              : null,
+            fitPageDisabled: ftp
+              ? ftp.classList.contains("disabled") || ftp.hasAttribute("disabled")
+              : null,
+            zoomDisabled: zoom
+              ? zoom.classList.contains("disabled") ||
+                zoom.hasAttribute("disabled")
+              : null,
+            fitWidthPresent: !!fw,
+          };
+          const key = JSON.stringify(report);
+          const g = win as { __oowViewZoomLast?: string };
+          if (g.__oowViewZoomLast !== key) {
+            g.__oowViewZoomLast = key;
+            console.info("[oow-view-zoom]", key);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    } finally {
+      this.viewControlsEnsuring = false;
+      // 重新挂上观察（若 watchdog 仍在）
+      try {
+        if (
+          this.viewControlsObserver &&
+          this.keepViewControls &&
+          this.readOnly
+        ) {
+          const toolbar = win.document?.querySelector(".toolbar");
+          if (toolbar) {
+            this.viewControlsObserver.observe(toolbar, {
+              attributes: true,
+              childList: true,
+              subtree: true,
+              attributeFilter: ["class", "disabled", "aria-disabled"],
+            });
+          }
+        }
+      } catch {
+        // ignore
+      }
     }
   }
 

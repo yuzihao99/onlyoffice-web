@@ -40,6 +40,119 @@ function 说(s: string) {
 }
 
 /**
+ * 用 iframe 视口像素强制整条高度链，不依赖 flex/% 解析。
+ * DocsAPI 常在挂载后写死偏矮 height；必须用 setProperty(..., important) 压住。
+ * 绝不能在改 style 时用 attributes MutationObserver（会死循环卡死）。
+ */
+let 铺满中 = false;
+let 铺满定时 = 0;
+
+function 写尺寸(el: HTMLElement, w: number, h: number) {
+  const pxW = w + "px";
+  const pxH = h + "px";
+  el.style.setProperty("position", "absolute", "important");
+  el.style.setProperty("left", "0", "important");
+  el.style.setProperty("top", "0", "important");
+  el.style.setProperty("right", "0", "important");
+  el.style.setProperty("bottom", "0", "important");
+  el.style.setProperty("width", pxW, "important");
+  el.style.setProperty("height", pxH, "important");
+  el.style.setProperty("max-height", "none", "important");
+  el.style.setProperty("min-height", "0", "important");
+  el.style.setProperty("border", "0", "important");
+  el.style.setProperty("box-sizing", "border-box", "important");
+  if (el.tagName === "IFRAME") {
+    el.setAttribute("width", String(w));
+    el.setAttribute("height", String(h));
+  }
+}
+
+function 铺满编辑器() {
+  if (铺满中) return;
+  const w = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 0);
+  const h = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 0);
+  if (w < 2 || h < 2) return;
+
+  铺满中 = true;
+  try {
+    const pxW = w + "px";
+    const pxH = h + "px";
+    document.documentElement.style.setProperty("height", pxH, "important");
+    document.documentElement.style.setProperty("width", pxW, "important");
+    document.body.style.setProperty("height", pxH, "important");
+    document.body.style.setProperty("width", pxW, "important");
+    document.body.style.setProperty("margin", "0", "important");
+    document.body.style.setProperty("overflow", "hidden", "important");
+
+    const stage = document.querySelector(".stage") as HTMLElement | null;
+    const box = document.querySelector(".onlyoffice-container") as HTMLElement | null;
+    if (stage) 写尺寸(stage, w, h);
+    if (box) 写尺寸(box, w, h);
+
+    const root = box || document.body;
+    const nodes = root.querySelectorAll<HTMLElement>(
+      "iframe, #iframe-office-id, [id^='iframe']",
+    );
+    nodes.forEach((el) => {
+      // 已铺满则跳过，减少无谓写 style
+      if (
+        el.style.getPropertyValue("width") === pxW &&
+        el.style.getPropertyValue("height") === pxH
+      ) {
+        return;
+      }
+      写尺寸(el, w, h);
+      if (el.tagName === "IFRAME") {
+        try {
+          (el as HTMLIFrameElement).contentWindow?.dispatchEvent(new Event("resize"));
+        } catch {
+          /* 跨域编辑器页 */
+        }
+      }
+    });
+  } finally {
+    铺满中 = false;
+  }
+}
+
+function 安排铺满() {
+  if (铺满定时) {
+    window.clearTimeout(铺满定时);
+  }
+  铺满定时 = window.setTimeout(() => {
+    铺满定时 = 0;
+    铺满编辑器();
+  }, 50);
+}
+
+function 监视编辑器尺寸() {
+  铺满编辑器();
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => 安排铺满());
+    ro.observe(document.documentElement);
+    const box = document.querySelector(".onlyoffice-container");
+    if (box) ro.observe(box);
+  }
+  const box = document.querySelector(".onlyoffice-container");
+  if (box) {
+    // 只盯子树增删，不盯 attributes，避免改 style 自激死循环
+    const mo = new MutationObserver(() => 安排铺满());
+    mo.observe(box, { childList: true, subtree: true });
+  }
+  window.addEventListener("resize", 安排铺满);
+  // DocsAPI 会在打开后反复改高度：前 30 秒密刷，之后每 2 秒兜底
+  let n = 0;
+  const fast = window.setInterval(() => {
+    铺满编辑器();
+    n += 1;
+    if (n >= 60) window.clearInterval(fast);
+  }, 500);
+  window.setInterval(() => 铺满编辑器(), 2000);
+}
+
+监视编辑器尺寸();
+
+/**
  * 该信哪个源。
  *
  * ⚠ **取不到就停在这里，不要回落成 `"*"`**。回落之后这一页照样能跑，
