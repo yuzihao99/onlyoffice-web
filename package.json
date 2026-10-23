@@ -8,6 +8,7 @@
   "scripts": {
     "assets": "node scripts/extract-assets.mjs",
     "x2t": "node scripts/fetch-x2t.mjs",
+    "x2t:patch": "node scripts/patch-x2t-null-callback.mjs",
     "fonts": "node scripts/build-x2t-fonts.mjs",
     "preload-pages": "node scripts/build-preload-pages.mjs",
     "check:preload-pages": "node scripts/build-preload-pages.mjs --check",

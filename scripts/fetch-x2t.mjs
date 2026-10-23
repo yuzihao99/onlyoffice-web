@@ -34,6 +34,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 import { X2T } from "../config.mjs";
+import { decompressWasm, patchX2tNullCallback } from "./patch-x2t-null-callback.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEST = path.join(ROOT, "vendor/x2t");
@@ -146,12 +147,17 @@ async function main() {
   fs.rmSync(DEST, { recursive: true, force: true });
   fs.mkdirSync(DEST, { recursive: true });
 
-  // 组件取回来自己认魔数：不是 wasm 就当 brotli 解。所以这里存的是压缩那一份，
-  // 名字仍叫 x2t.wasm——省 29 MB 下载，而组件那边一个字都不用改。
-  fs.writeFileSync(path.join(DEST, "x2t.wasm"), files.get("x2t.wasm.br"));
+  // 校验和通过之后才改字节。空图片回调会让 Chrome 里的旧版 ppt 停在「未知错误」。
+  // 组件取回来自己认魔数：不是 wasm 就当 brotli 解。所以这里存的仍是压缩那一份，
+  // 名字仍叫 x2t.wasm——省下载，而组件那边一个字都不用改。
+  const patched = patchX2tNullCallback(decompressWasm(files.get("x2t.wasm.br")));
+  const patchedBr = zlib.brotliCompressSync(patched, {
+    params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 6 },
+  });
+  fs.writeFileSync(path.join(DEST, "x2t.wasm"), patchedBr);
   fs.writeFileSync(path.join(DEST, "x2t.js"), files.get("x2t.js"));
 
-  const shape = describeWasm(files.get("x2t.wasm.br"));
+  const shape = describeWasm(patchedBr);
   const source = {
     说明: "这份 x2t 是从哪来的。别手改——由 scripts/fetch-x2t.mjs 生成。",
     来源: X2T.source,
@@ -161,8 +167,9 @@ async function main() {
     校验和sha512: X2T.sha512,
     基于的core版本: X2T.builtFromCore,
     取的时间: new Date().toISOString(),
+    补丁: "null-image-callback：scripts/patch-x2t-null-callback.mjs，函数 62523 的空 call_indirect 改成跳过",
     产物: {
-      "x2t.wasm": { ...shape, 说明: "存的是 brotli 压缩那一份，组件自己解" },
+      "x2t.wasm": { ...shape, 说明: "存的是补过空回调之后再 brotli 压缩的那一份，组件自己解" },
       "x2t.js": { 字节: files.get("x2t.js").length },
     },
   };

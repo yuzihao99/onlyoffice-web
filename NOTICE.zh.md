@@ -53,6 +53,13 @@ ONLYOFFICE 按 GNU Affero 通用公共许可证第 3 版发布，并附有 Ascen
 | **预热 iframe 改成只加载一个编辑器的东西，不再四个一起** | 组件挂编辑器之前先塞一个隐藏 iframe，指向上游的 `web-apps/apps/api/documents/preload.html`，而那一页把**四个编辑器**（word / cell / slide / visio）的引擎、引导包与界面外壳全拉一遍，与这次打开的是什么文档无关。任何一次打开都有三个用不上，冷载因此多约 90 MB。上游那份 `preload.html` 原样留在盘上；旁边按编辑器应用各生成一份（`preload-<应用>.html`，由 `scripts/build-preload-pages.mjs` 从上游那一页生成，带着它的许可声明头并标明是生成物），组件按文档类型挑对应那一份。那几页里引擎用的是 `<link rel="preload">` 而不是 `<script>`——预热缓存不需要在隐藏 iframe 里执行 27.5 MB 的 JavaScript。实测：冷载从 221.7 MB 降到 131.1 MB，行为没有变化，并有一条自动断言守着「另外三个编辑器的东西一个请求都没有」。 |
 | **静态资源的压缩副本随包发出、并且真的发出去** | 社区版镜像给每个文件旁边都配了一份 `.gz`，245 个字体文件一个不落；我们的抽取步骤从前把它们全删了，理由写的是「没有静态服务器会去读这些」——那是错的，nginx 的 `gzip_static` 读的就是这些。现在改成由 `scripts/precompress.mjs` 在本机现配（顺带覆盖本项目自己生成的那些文件），随包带的后端按 nginx `gzip_static` 同样的判据发它们。这一条不改上游任何文件。实测：冷载从 131.1 MB 降到 58.5 MB。 |
 
+### 2026-10-23
+
+| 改了什么 | 为什么 |
+|---|---|
+| **缺了的 libheif 导入不再把转换直接中止** | 发布的 `x2t.js` 把 libheif 留成 `abort("missing function")` 桩。旧版 ppt 读 wmf、dib 图片时会碰到这些桩，一调用就把转换中止，编辑器只显示「未知错误」。Worker 在执行脚本前把桩改掉：这一张图跳过，文件其余部分照常打开。 |
+| **`x2t.wasm` 遇到空的图片回调就跳过** | 同一类文件接着会走到函数 62523 里一次函数指针为空的 `call_indirect`。这次转换在 Node 里能走完；Chrome 会陷阱成 `null function`，编辑器同样只显示「未知错误」。`scripts/patch-x2t-null-callback.mjs` 把这一处改成指针为空就跳过，有效回调仍然执行。`npm run x2t` 在发布件校验和通过之后打上它。wasm 本体不进 git，这个脚本就是这一处修改的对应源码。 |
+
 ## 三、对应源码在哪
 
 **本项目的完整源码在 <https://github.com/yuhaibohotmail/onlyoffice-web>**，
@@ -65,7 +72,7 @@ ONLYOFFICE 按 GNU Affero 通用公共许可证第 3 版发布，并附有 Ascen
 其中**格式转换引擎**（浏览器里那个 WebAssembly 模块）来自
 CryptPad 的 `onlyoffice-x2t-wasm`（<https://github.com/cryptpad/onlyoffice-x2t-wasm>）——
 一份公开的、把 ONLYOFFICE core 用 emscripten 编成 WebAssembly 的配方，同样按 AGPL 发布。
-我们取的是它发布的产物并核对了官方校验和（见 `scripts/fetch-x2t.mjs`），
+我们取的是它发布的产物，核对官方校验和，再打上 `scripts/patch-x2t-null-callback.mjs` 里的空回调补丁（见 `scripts/fetch-x2t.mjs`）。
 自己从源码构建的做法写在 `build/x2t/README.zh.md` 里。
 
 **上游那个组件包里的同一个模块曾被当成「没有对应源码」的东西，那是不成立的**：

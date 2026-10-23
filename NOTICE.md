@@ -53,6 +53,13 @@ Non-code content (illustrations, icon sets, documentation) is licensed under **C
 | **The warm-up frame now loads one editor's bundles instead of all four** | Before mounting the editor, the component inserts a hidden iframe pointing at upstream's `web-apps/apps/api/documents/preload.html`, and that page fetches the engine, the bootstrap bundle and the application shell of **all four editors** (word / cell / slide / visio), regardless of which document is being opened. Three of the four are unused on any given open, which is about 90 MB of a cold load. Upstream's `preload.html` is left on disk untouched; alongside it we now generate one page per editor application (`preload-<application>.html`, produced by `scripts/build-preload-pages.mjs` from upstream's page, carrying its license header and marked as generated), and the component picks the one matching the document type. In those pages the engine is a `<link rel="preload">` rather than a `<script>`, because warming the cache does not require executing 27.5 MB of JavaScript in a hidden frame. Measured: a cold load falls from 221.7 MB to 131.1 MB with no change in behaviour, and an automated check asserts that the other three editors' bundles are never requested. |
 | **Compressed copies of the static assets are shipped and served** | The Community Edition image places a `.gz` next to every file, including all 245 font files; our extraction step used to delete all of them, on the incorrect grounds that no static server reads them (nginx's `gzip_static` reads exactly those). They are now rebuilt locally by `scripts/precompress.mjs`, which also covers the files this project generates itself, and the bundled back end serves them the same way nginx's `gzip_static` does. No upstream file is modified by this. Measured: a cold load falls from 131.1 MB to 58.5 MB. |
 
+### 2026-10-23
+
+| What was changed | Why |
+|---|---|
+| **Missing libheif imports no longer abort conversion** | The released `x2t.js` leaves libheif as `abort("missing function")` stubs. Old PowerPoint files probe those stubs while reading WMF or DIB pictures, the stub aborts, and the editor shows an unknown error. The worker rewrites the stubs before the script runs: the picture is skipped and the rest of the file still opens. |
+| **`x2t.wasm` skips a null image callback** | The same files then reach one `call_indirect` in function 62523 whose function pointer is null. The conversion finishes in Node; Chrome traps with `null function` and the editor shows an unknown error. `scripts/patch-x2t-null-callback.mjs` rewrites that call so a null pointer is skipped and a real callback still runs. `npm run x2t` applies it after the release checksum matches. The wasm binary is not stored in git; the patch script is the corresponding source for this change. |
+
 ## 3. Where the corresponding source code is
 
 **The complete source code of this project is at <https://github.com/yuhaibohotmail/onlyoffice-web>**,
@@ -65,8 +72,8 @@ For how to set it, see `LegalNoticeOptions.sourceUrl` (plain static deployment) 
 Within it, the **format conversion engine** (the WebAssembly module in the browser) comes from
 CryptPad's `onlyoffice-x2t-wasm` (<https://github.com/cryptpad/onlyoffice-x2t-wasm>) —
 a public recipe that compiles ONLYOFFICE core to WebAssembly with emscripten, also released under the AGPL.
-We use its released artifacts and verified them against the official checksums (see `scripts/fetch-x2t.mjs`);
-how to build it yourself from source is described in `build/x2t/README.md`.
+We use its released artifacts, verify them against the official checksums, then apply the null-callback patch in `scripts/patch-x2t-null-callback.mjs` (see `scripts/fetch-x2t.mjs`).
+How to build it yourself from source is described in `build/x2t/README.md`.
 
 **The same module in the upstream component package was once treated as something "without corresponding source"; that claim does not hold**:
 its startup script is identical word for word to the corresponding file in the CryptPad repository, and it exports entry symbols that only CryptPad's wrapper code
